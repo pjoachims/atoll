@@ -109,6 +109,31 @@ enum Config {
         guard !FileManager.default.fileExists(atPath: tabsFile) else { return }
         save(defaultTabs)
     }
+
+    // MARK: launch directory
+
+    // Where new panes cd to. install.sh can seed the "launchDir" pref; if it
+    // didn't (or the saved path has since gone away) fall back to the first
+    // checkout root that actually exists, and to $HOME if none do.
+    static let launchDirCandidates: [String] = ["Documents/git", "Documents/repos",
+                                                "Developer", "repos", "dev", "src",
+                                                "code", "projects"]
+        .map { NSHomeDirectory() + "/" + $0 }
+
+    static var defaultLaunchDir: String {
+        launchDirCandidates.first(where: isDir) ?? NSHomeDirectory()
+    }
+
+    static var launchDir: String {
+        guard let saved = UserDefaults.standard.string(forKey: "launchDir"), isDir(saved)
+        else { return defaultLaunchDir }
+        return saved
+    }
+
+    static func isDir(_ path: String) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &dir) && dir.boolValue
+    }
 }
 
 // MARK: - Model
@@ -126,9 +151,11 @@ final class Store: ObservableObject {
     @Published var hotkey: String = UserDefaults.standard.string(forKey: "hotkey") ?? "ctrl-opt-space" {
         didSet { UserDefaults.standard.set(hotkey, forKey: "hotkey") }
     }
-    @Published var launchDir: String = UserDefaults.standard.string(forKey: "launchDir")
-        ?? NSHomeDirectory() + "/Documents/git" {
-        didSet { UserDefaults.standard.set(launchDir, forKey: "launchDir") }
+    @Published var launchDir: String = Config.launchDir {
+        didSet {
+            UserDefaults.standard.set(launchDir, forKey: "launchDir")
+            repoChoices = Store.repoChoices(for: launchDir)
+        }
     }
     @Published var themeID: String = UserDefaults.standard.string(forKey: "theme") ?? "tarmac" {
         didSet { UserDefaults.standard.set(themeID, forKey: "theme") }
@@ -175,16 +202,51 @@ final class Store: ObservableObject {
     @Published var termH: CGFloat = UserDefaults.standard.object(forKey: "termH") as? CGFloat ?? 440 {
         didSet { UserDefaults.standard.set(termH, forKey: "termH") }
     }
-    // ~/Documents/git itself + every git repo directly under it
-    let repoChoices: [String] = {
-        let root = NSHomeDirectory() + "/Documents/git"
+    // the current launch dir itself + every git repo directly under it, so the
+    // menu keeps offering useful jumps wherever the user pointed Atoll
+    @Published var repoChoices: [String] = Store.repoChoices(for: Config.launchDir)
+
+    static func repoChoices(for root: String) -> [String] {
         let fm = FileManager.default
         let subs = (try? fm.contentsOfDirectory(atPath: root)) ?? []
-        return [root] + subs.sorted().compactMap { name in
+        let repos = subs.sorted().compactMap { name -> String? in
             let p = root + "/" + name
             return fm.fileExists(atPath: p + "/.git") ? p : nil
         }
-    }()
+        // home is always reachable, so the picker can never strand the user
+        let home = NSHomeDirectory()
+        return ([root] + repos + [home]).reduce(into: []) { acc, p in
+            if !acc.contains(p) { acc.append(p) }
+        }
+    }
+
+    // ~/Documents/git rather than /Users/me/Documents/git, and just the repo
+    // name for the checkouts underneath
+    static func menuLabel(for path: String, root: String) -> String {
+        let home = NSHomeDirectory()
+        guard path == root || path == home else {
+            return (path as NSString).lastPathComponent
+        }
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") { return "~" + String(path.dropFirst(home.count)) }
+        return path
+    }
+
+    // "Other Folder…": pick any directory, not just a sibling checkout
+    func chooseLaunchDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use Folder"
+        panel.message = "New Atoll sessions will start here."
+        panel.directoryURL = URL(fileURLWithPath: launchDir)
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            launchDir = url.path
+        }
+    }
 
     init() {
         let t = Config.loadTabs()
@@ -382,8 +444,7 @@ final class PaneHost: NSObject, LocalProcessTerminalViewDelegate {
         for k in env.keys where k.hasPrefix("HERDR_") { env.removeValue(forKey: k) }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
-        let cwd = UserDefaults.standard.string(forKey: "launchDir")
-            ?? NSHomeDirectory() + "/Documents/git"
+        let cwd = Config.launchDir
         let cmd = (tab.command?.isEmpty == false) ? tab.command! : "zsh -il"
         t.startProcess(
             executable: "/bin/zsh",
@@ -516,8 +577,7 @@ struct WidgetPane: View {
         gen += 1
         let g = gen
         let cmd = (tab.command?.isEmpty == false) ? tab.command! : "echo 'set \"command\" in tabs.json'"
-        let cwd = UserDefaults.standard.string(forKey: "launchDir")
-            ?? NSHomeDirectory() + "/Documents/git"
+        let cwd = Config.launchDir
         DispatchQueue.global(qos: .utility).async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -616,11 +676,10 @@ struct IslandView: View {
                 Toggle("Auto-focus keyboard on hover", isOn: $store.autoFocus)
                 Picker("New sessions start in", selection: $store.launchDir) {
                     ForEach(store.repoChoices, id: \.self) { p in
-                        Text(p == NSHomeDirectory() + "/Documents/git"
-                            ? "~/Documents/git" : (p as NSString).lastPathComponent)
-                            .tag(p)
+                        Text(Store.menuLabel(for: p, root: store.launchDir)).tag(p)
                     }
                 }
+                Button("Choose Start Folder…") { store.chooseLaunchDir() }
                 Picker("Toggle Shortcut", selection: $store.hotkey) {
                     ForEach(hotKeyPresets, id: \.id) { p in
                         Text(p.label).tag(p.id)
