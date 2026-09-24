@@ -608,13 +608,21 @@ struct WidgetPane: View {
 
 // One WKWebView per web tab, kept alive across tab switches so logins and
 // scroll position survive; created lazily on first expand like terminals
-final class WebHost {
+final class WebHost: NSObject, WKUIDelegate {
     static let shared = WebHost()
     private(set) var webs: [String: WKWebView] = [:]
+
+    // target=_blank / window.open: there is no second window, so open it in place
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
 
     func web(for tab: TabSpec) -> WKWebView {
         if let w = webs[tab.name] { return w }
         let w = WKWebView(frame: .zero)
+        w.uiDelegate = self
         var s = tab.url ?? ""
         if !s.isEmpty && !s.contains("://") { s = "https://" + s }
         if let u = URL(string: s) { w.load(URLRequest(url: u)) }
@@ -641,7 +649,7 @@ struct IslandView: View {
     var onResize: (Bool) -> Void // ended?
     @State private var newName = ""
     @State private var newCommand = ""
-    @FocusState private var nameFocus: Bool
+    @FocusState private var commandFocus: Bool
 
     var body: some View {
         let t = store.theme
@@ -839,15 +847,15 @@ struct IslandView: View {
                     }
                 }
             } else {
-                Text("no tools found :(")
+                Text("type a command below · name is optional")
                     .font(mono(10))
                     .foregroundStyle(Color(nsColor: t.dim))
             }
             HStack(spacing: 8) {
-                TextField("name", text: $newName)
+                TextField("command, e.g. dbq dev", text: $newCommand)
+                    .focused($commandFocus)
+                TextField(newCommand.isEmpty ? "name" : derivedName, text: $newName)
                     .frame(width: 76)
-                    .focused($nameFocus)
-                TextField("command · empty = shell", text: $newCommand)
                 Button("add") { submitNewTab() }
                     .buttonStyle(BrutalChip(corner: store.chipRadius))
                     .disabled(!canAdd)
@@ -872,7 +880,7 @@ struct IslandView: View {
         .onAppear {
             store.scanTools() // tools installed since launch show up as chips
             // panel only becomes key a beat after the + click; focus too early is dropped
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { nameFocus = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { commandFocus = true }
         }
     }
 
@@ -892,14 +900,25 @@ struct IslandView: View {
         cancelNewTab()
     }
 
-    var canAdd: Bool {
-        let n = newName.trimmingCharacters(in: .whitespaces)
-        return !n.isEmpty && !store.tabs.contains { $0.name == n }
+    // name left blank → the command itself (or "Shell"), suffixed until unique
+    var derivedName: String {
+        let cmd = newCommand.trimmingCharacters(in: .whitespaces)
+        let base = cmd.isEmpty ? "Shell" : cmd
+        var n = base, i = 2
+        while store.tabs.contains(where: { $0.name == n }) { n = "\(base) \(i)"; i += 1 }
+        return n
     }
+
+    var tabName: String {
+        let n = newName.trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? derivedName : n
+    }
+
+    var canAdd: Bool { !store.tabs.contains { $0.name == tabName } }
 
     func submitNewTab() {
         guard canAdd else { return }
-        store.addTab(name: newName, command: newCommand, notes: false)
+        store.addTab(name: tabName, command: newCommand, notes: false)
         cancelNewTab()
     }
 
@@ -967,6 +986,30 @@ struct BlinkCursor: View {
 final class IslandPanel: NSPanel {
     // borderless panels refuse key status by default; without it SwiftUI taps never fire
     override var canBecomeKey: Bool { true }
+
+    // An accessory app has no Edit menu, and ⌘C/⌘V/… only reach text fields
+    // and web panes through one. Views that handle a shortcut themselves
+    // (terminal panes) get it first via super; the rest go to the responder chain.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return false
+        }
+        let shift = flags.contains(.shift)
+        let action: Selector?
+        switch (key, shift) {
+        case ("x", false): action = #selector(NSText.cut(_:))
+        case ("c", false): action = #selector(NSText.copy(_:))
+        case ("v", false): action = #selector(NSText.paste(_:))
+        case ("a", false): action = #selector(NSText.selectAll(_:))
+        case ("z", false): action = Selector(("undo:"))
+        case ("z", true): action = Selector(("redo:"))
+        default: action = nil
+        }
+        guard let action else { return false }
+        return NSApp.sendAction(action, to: nil, from: self)
+    }
 }
 
 final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
