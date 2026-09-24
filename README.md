@@ -81,6 +81,19 @@ Downloads the latest [release](https://github.com/pjoachims/atoll/releases)
 into `/Applications` and launches it (replacing an old Claude Island.app if
 present; prefs carry over).
 
+It also asks where new sessions should start, defaulting to the first checkout
+root it finds (`~/Documents/git`, `~/Developer`, `~/repos`, `~/dev`, `~/src`,
+`~/code`, `~/projects`, …, else `~`). Answer non-interactively with `ATOLL_DIR`,
+or `skip` to leave the setting to the app:
+
+```sh
+curl -fsSL .../install.sh | ATOLL_DIR=~/code sh
+```
+
+You can change it later from the right-click menu: "New sessions start in" lists
+that directory and the git checkouts inside it, and "Choose Start Folder…" opens
+a picker for anywhere else.
+
 If you download the zip in a browser instead, macOS will block the app ("Apple
 could not verify...") because it's ad-hoc signed, not notarized. Either use the
 installer above (curl downloads skip quarantine), or after the blocked launch go

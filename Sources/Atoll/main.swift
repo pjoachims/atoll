@@ -109,6 +109,31 @@ enum Config {
         guard !FileManager.default.fileExists(atPath: tabsFile) else { return }
         save(defaultTabs)
     }
+
+    // MARK: launch directory
+
+    // Where new panes cd to. install.sh can seed the "launchDir" pref; if it
+    // didn't (or the saved path has since gone away) fall back to the first
+    // checkout root that actually exists, and to $HOME if none do.
+    static let launchDirCandidates: [String] = ["Documents/git", "Documents/repos",
+                                                "Developer", "repos", "dev", "src",
+                                                "code", "projects"]
+        .map { NSHomeDirectory() + "/" + $0 }
+
+    static var defaultLaunchDir: String {
+        launchDirCandidates.first(where: isDir) ?? NSHomeDirectory()
+    }
+
+    static var launchDir: String {
+        guard let saved = UserDefaults.standard.string(forKey: "launchDir"), isDir(saved)
+        else { return defaultLaunchDir }
+        return saved
+    }
+
+    static func isDir(_ path: String) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &dir) && dir.boolValue
+    }
 }
 
 // MARK: - Model
@@ -126,9 +151,11 @@ final class Store: ObservableObject {
     @Published var hotkey: String = UserDefaults.standard.string(forKey: "hotkey") ?? "ctrl-opt-space" {
         didSet { UserDefaults.standard.set(hotkey, forKey: "hotkey") }
     }
-    @Published var launchDir: String = UserDefaults.standard.string(forKey: "launchDir")
-        ?? NSHomeDirectory() + "/Documents/git" {
-        didSet { UserDefaults.standard.set(launchDir, forKey: "launchDir") }
+    @Published var launchDir: String = Config.launchDir {
+        didSet {
+            UserDefaults.standard.set(launchDir, forKey: "launchDir")
+            repoChoices = Store.repoChoices(for: launchDir)
+        }
     }
     @Published var themeID: String = UserDefaults.standard.string(forKey: "theme") ?? "tarmac" {
         didSet { UserDefaults.standard.set(themeID, forKey: "theme") }
@@ -175,16 +202,51 @@ final class Store: ObservableObject {
     @Published var termH: CGFloat = UserDefaults.standard.object(forKey: "termH") as? CGFloat ?? 440 {
         didSet { UserDefaults.standard.set(termH, forKey: "termH") }
     }
-    // ~/Documents/git itself + every git repo directly under it
-    let repoChoices: [String] = {
-        let root = NSHomeDirectory() + "/Documents/git"
+    // the current launch dir itself + every git repo directly under it, so the
+    // menu keeps offering useful jumps wherever the user pointed Atoll
+    @Published var repoChoices: [String] = Store.repoChoices(for: Config.launchDir)
+
+    static func repoChoices(for root: String) -> [String] {
         let fm = FileManager.default
         let subs = (try? fm.contentsOfDirectory(atPath: root)) ?? []
-        return [root] + subs.sorted().compactMap { name in
+        let repos = subs.sorted().compactMap { name -> String? in
             let p = root + "/" + name
             return fm.fileExists(atPath: p + "/.git") ? p : nil
         }
-    }()
+        // home is always reachable, so the picker can never strand the user
+        let home = NSHomeDirectory()
+        return ([root] + repos + [home]).reduce(into: []) { acc, p in
+            if !acc.contains(p) { acc.append(p) }
+        }
+    }
+
+    // ~/Documents/git rather than /Users/me/Documents/git, and just the repo
+    // name for the checkouts underneath
+    static func menuLabel(for path: String, root: String) -> String {
+        let home = NSHomeDirectory()
+        guard path == root || path == home else {
+            return (path as NSString).lastPathComponent
+        }
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") { return "~" + String(path.dropFirst(home.count)) }
+        return path
+    }
+
+    // "Other Folder…": pick any directory, not just a sibling checkout
+    func chooseLaunchDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use Folder"
+        panel.message = "New Atoll sessions will start here."
+        panel.directoryURL = URL(fileURLWithPath: launchDir)
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            launchDir = url.path
+        }
+    }
 
     init() {
         let t = Config.loadTabs()
@@ -382,8 +444,7 @@ final class PaneHost: NSObject, LocalProcessTerminalViewDelegate {
         for k in env.keys where k.hasPrefix("HERDR_") { env.removeValue(forKey: k) }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
-        let cwd = UserDefaults.standard.string(forKey: "launchDir")
-            ?? NSHomeDirectory() + "/Documents/git"
+        let cwd = Config.launchDir
         let cmd = (tab.command?.isEmpty == false) ? tab.command! : "zsh -il"
         t.startProcess(
             executable: "/bin/zsh",
@@ -516,8 +577,7 @@ struct WidgetPane: View {
         gen += 1
         let g = gen
         let cmd = (tab.command?.isEmpty == false) ? tab.command! : "echo 'set \"command\" in tabs.json'"
-        let cwd = UserDefaults.standard.string(forKey: "launchDir")
-            ?? NSHomeDirectory() + "/Documents/git"
+        let cwd = Config.launchDir
         DispatchQueue.global(qos: .utility).async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -548,13 +608,21 @@ struct WidgetPane: View {
 
 // One WKWebView per web tab, kept alive across tab switches so logins and
 // scroll position survive; created lazily on first expand like terminals
-final class WebHost {
+final class WebHost: NSObject, WKUIDelegate {
     static let shared = WebHost()
     private(set) var webs: [String: WKWebView] = [:]
+
+    // target=_blank / window.open: there is no second window, so open it in place
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
 
     func web(for tab: TabSpec) -> WKWebView {
         if let w = webs[tab.name] { return w }
         let w = WKWebView(frame: .zero)
+        w.uiDelegate = self
         var s = tab.url ?? ""
         if !s.isEmpty && !s.contains("://") { s = "https://" + s }
         if let u = URL(string: s) { w.load(URLRequest(url: u)) }
@@ -581,7 +649,7 @@ struct IslandView: View {
     var onResize: (Bool) -> Void // ended?
     @State private var newName = ""
     @State private var newCommand = ""
-    @FocusState private var nameFocus: Bool
+    @FocusState private var commandFocus: Bool
 
     var body: some View {
         let t = store.theme
@@ -616,11 +684,10 @@ struct IslandView: View {
                 Toggle("Auto-focus keyboard on hover", isOn: $store.autoFocus)
                 Picker("New sessions start in", selection: $store.launchDir) {
                     ForEach(store.repoChoices, id: \.self) { p in
-                        Text(p == NSHomeDirectory() + "/Documents/git"
-                            ? "~/Documents/git" : (p as NSString).lastPathComponent)
-                            .tag(p)
+                        Text(Store.menuLabel(for: p, root: store.launchDir)).tag(p)
                     }
                 }
+                Button("Choose Start Folder…") { store.chooseLaunchDir() }
                 Picker("Toggle Shortcut", selection: $store.hotkey) {
                     ForEach(hotKeyPresets, id: \.id) { p in
                         Text(p.label).tag(p.id)
@@ -780,15 +847,15 @@ struct IslandView: View {
                     }
                 }
             } else {
-                Text("no tools found :(")
+                Text("type a command below · name is optional")
                     .font(mono(10))
                     .foregroundStyle(Color(nsColor: t.dim))
             }
             HStack(spacing: 8) {
-                TextField("name", text: $newName)
+                TextField("command, e.g. dbq dev", text: $newCommand)
+                    .focused($commandFocus)
+                TextField(newCommand.isEmpty ? "name" : derivedName, text: $newName)
                     .frame(width: 76)
-                    .focused($nameFocus)
-                TextField("command · empty = shell", text: $newCommand)
                 Button("add") { submitNewTab() }
                     .buttonStyle(BrutalChip(corner: store.chipRadius))
                     .disabled(!canAdd)
@@ -813,7 +880,7 @@ struct IslandView: View {
         .onAppear {
             store.scanTools() // tools installed since launch show up as chips
             // panel only becomes key a beat after the + click; focus too early is dropped
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { nameFocus = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { commandFocus = true }
         }
     }
 
@@ -833,14 +900,25 @@ struct IslandView: View {
         cancelNewTab()
     }
 
-    var canAdd: Bool {
-        let n = newName.trimmingCharacters(in: .whitespaces)
-        return !n.isEmpty && !store.tabs.contains { $0.name == n }
+    // name left blank → the command itself (or "Shell"), suffixed until unique
+    var derivedName: String {
+        let cmd = newCommand.trimmingCharacters(in: .whitespaces)
+        let base = cmd.isEmpty ? "Shell" : cmd
+        var n = base, i = 2
+        while store.tabs.contains(where: { $0.name == n }) { n = "\(base) \(i)"; i += 1 }
+        return n
     }
+
+    var tabName: String {
+        let n = newName.trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? derivedName : n
+    }
+
+    var canAdd: Bool { !store.tabs.contains { $0.name == tabName } }
 
     func submitNewTab() {
         guard canAdd else { return }
-        store.addTab(name: newName, command: newCommand, notes: false)
+        store.addTab(name: tabName, command: newCommand, notes: false)
         cancelNewTab()
     }
 
@@ -908,6 +986,30 @@ struct BlinkCursor: View {
 final class IslandPanel: NSPanel {
     // borderless panels refuse key status by default; without it SwiftUI taps never fire
     override var canBecomeKey: Bool { true }
+
+    // An accessory app has no Edit menu, and ⌘C/⌘V/… only reach text fields
+    // and web panes through one. Views that handle a shortcut themselves
+    // (terminal panes) get it first via super; the rest go to the responder chain.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return false
+        }
+        let shift = flags.contains(.shift)
+        let action: Selector?
+        switch (key, shift) {
+        case ("x", false): action = #selector(NSText.cut(_:))
+        case ("c", false): action = #selector(NSText.copy(_:))
+        case ("v", false): action = #selector(NSText.paste(_:))
+        case ("a", false): action = #selector(NSText.selectAll(_:))
+        case ("z", false): action = Selector(("undo:"))
+        case ("z", true): action = Selector(("redo:"))
+        default: action = nil
+        }
+        guard let action else { return false }
+        return NSApp.sendAction(action, to: nil, from: self)
+    }
 }
 
 final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
