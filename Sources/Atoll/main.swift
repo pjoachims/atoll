@@ -661,19 +661,22 @@ struct IslandView: View {
             bottomTrailingRadius: store.expanded ? store.panelRadius : store.pillRadius)
             .fill(store.expanded ? Color(nsColor: t.ink) : Color.black)
             .overlay(alignment: .top) {
-                // always attached at the chosen size so the pty never sees pill-sized
-                // resizes (they made the TUI reflow to ~40 cols and stick there)
-                VStack(spacing: 6) {
-                    tabBar
-                    pane
-                        .frame(width: store.termW, height: store.termH)
-                        .overlay(alignment: .top) {
-                            if store.addingTab { addCard.padding(.top, 4) }
-                        }
+                // detached while collapsed: an invisible pane still re-laid-out on
+                // every TUI redraw (~4% CPU idle). PaneHost keeps the terminal +
+                // pty alive at the chosen size, so re-attaching never resizes it
+                if store.expanded {
+                    VStack(spacing: 6) {
+                        tabBar
+                        pane
+                            .frame(width: store.termW, height: store.termH)
+                            .overlay(alignment: .top) {
+                                if store.addingTab { addCard.padding(.top, 4) }
+                            }
+                    }
+                    .padding(.top, (store.overMenuBar ? notchH : 0) + 8)
+                    .opacity(store.resizing ? 0 : 1)
+                    .allowsHitTesting(!store.resizing)
                 }
-                .padding(.top, (store.overMenuBar ? notchH : 0) + 8)
-                .opacity(store.expanded && !store.resizing ? 1 : 0)
-                .allowsHitTesting(store.expanded && !store.resizing)
             }
             .overlay(alignment: .bottom) { if !store.expanded && store.overMenuBar { pillDots } }
             .overlay(alignment: .bottomTrailing) {
