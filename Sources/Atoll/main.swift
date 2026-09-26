@@ -1137,6 +1137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &bag)
         setExpanded(false)
         panel.orderFrontRegardless()
+        startLauncherWatch()
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.typedSinceExpand = true
@@ -1282,6 +1283,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.collapseTimer = nil
             self.setExpanded(false)
         }
+    }
+
+    // Launcher-style windows (Raycast sits at layer 8, Spotlight at 23) open
+    // below our .statusBar panel. While another app shows a window above the
+    // floating level that overlaps us, drop just beneath its layer; restore
+    // once it's gone. Floating (3) and below is left alone so persistent
+    // utility windows (PiP, reminders) don't keep us sunk. Their panels don't
+    // activate, so nothing notifies us — poll the (cheap) on-screen list.
+    var launcherTimer: Timer?
+
+    func startLauncherWatch() {
+        let t = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in self?.yieldToOverlays() }
+        t.tolerance = 0.05
+        RunLoop.main.add(t, forMode: .common)
+        launcherTimer = t
+    }
+
+    func yieldToOverlays() {
+        let base = NSWindow.Level.statusBar
+        // CG window bounds are top-left based on the primary screen
+        let f = panel.frame
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let ours = CGRect(x: f.minX, y: primaryH - f.maxY, width: f.width, height: f.height)
+        let me = Int(getpid())
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let layers = list.compactMap { w -> Int? in
+            guard let layer = w[kCGWindowLayer as String] as? Int,
+                  layer > NSWindow.Level.floating.rawValue, layer < base.rawValue,
+                  (w[kCGWindowOwnerPID as String] as? Int) != me,
+                  // system chrome: menu bar, Dock
+                  !["Window Server", "Dock"].contains(w[kCGWindowOwnerName as String] as? String ?? ""),
+                  let b = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: b), r.intersects(ours) else { return nil }
+            return layer
+        }
+        let want = layers.min().map { NSWindow.Level(rawValue: $0 - 1) } ?? base
+        if panel.level != want { panel.level = want }
     }
 
     // Resize drag: the real panel (SwiftUI + terminal) is expensive to resize
