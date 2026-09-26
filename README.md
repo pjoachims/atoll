@@ -56,6 +56,14 @@ Beyond terminals, a tab can be:
   ```json
   { "name": "CI", "type": "web", "url": "https://github.com/notifications" }
   ```
+- **Browser** — a web pane with its own page tabs and an address bar (url or
+  search). "+" → Browser, or paste an `https://` url into the command field.
+  ⌘T / ⌘W open and close page tabs, ⌘L focuses the address bar, ⌘⇧[ / ⌘⇧]
+  cycle, ⌘-click opens a link in a background tab. Open pages are restored on
+  relaunch; `url` (optional) is the first page:
+  ```json
+  { "name": "Browser", "type": "browser" }
+  ```
 
 ### atollctl — script the island
 

@@ -68,6 +68,7 @@ func currentTheme() -> Theme {
 //   type "notes"  native scratchpad persisted to notes.md
 //   type "widget" polled `command` output rendered as text, every `refresh`s
 //   type "web"    WKWebView pinned to `url` (session survives tab switches)
+//   type "browser" same, plus an address bar and back/forward; `url` is the start page
 struct TabSpec: Codable, Equatable {
     var name: String
     var command: String?
@@ -76,7 +77,8 @@ struct TabSpec: Codable, Equatable {
     var refresh: Int?
     var isNotes: Bool { type == "notes" }
     var isWidget: Bool { type == "widget" }
-    var isWeb: Bool { type == "web" }
+    var isBrowser: Bool { type == "browser" }
+    var isWeb: Bool { type == "web" || isBrowser }
 }
 
 enum Config {
@@ -286,16 +288,28 @@ final class Store: ObservableObject {
     }
 
     func addTab(name: String, command: String, notes: Bool) {
-        let n = name.trimmingCharacters(in: .whitespaces)
-        guard !n.isEmpty, !tabs.contains(where: { $0.name == n }) else { return }
         let cmd = command.trimmingCharacters(in: .whitespaces)
-        tabs.append(.init(
-            name: n,
+        addTab(.init(
+            name: name,
             command: notes || cmd.isEmpty ? nil : cmd,
             type: notes ? "notes" : nil))
+    }
+
+    func addTab(_ spec: TabSpec) {
+        var spec = spec
+        spec.name = spec.name.trimmingCharacters(in: .whitespaces)
+        guard !spec.name.isEmpty, !tabs.contains(where: { $0.name == spec.name }) else { return }
+        tabs.append(spec)
         Config.save(tabs)
-        selected = n
+        selected = spec.name
         addingTab = false
+    }
+
+    // "Browser" -> "Browser 2", "Browser 3", … so any tab type can be added again
+    func uniqueName(_ base: String) -> String {
+        var n = base, i = 2
+        while tabs.contains(where: { $0.name == n }) { n = "\(base) \(i)"; i += 1 }
+        return n
     }
 
     func removeTab(_ name: String) {
@@ -606,38 +620,342 @@ struct WidgetPane: View {
 
 // MARK: - Web pane
 
-// One WKWebView per web tab, kept alive across tab switches so logins and
-// scroll position survive; created lazily on first expand like terminals
-final class WebHost: NSObject, WKUIDelegate {
+// One WKWebView per web tab (a BrowserSession of them per browser tab), kept
+// alive across tab switches so logins and scroll position survive; created
+// lazily on first expand like terminals
+final class WebHost: NSObject, WKUIDelegate, WKNavigationDelegate {
     static let shared = WebHost()
     private(set) var webs: [String: WKWebView] = [:]
+    private var sessions: [String: BrowserSession] = [:]
+    static let startPage = "https://duckduckgo.com"
 
-    // target=_blank / window.open: there is no second window, so open it in place
+    // address-bar input -> URL: full URLs as-is, bare hosts get a scheme,
+    // anything else is a search
+    static func url(from input: String) -> URL? {
+        let s = input.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        if s.contains("://") { return URL(string: s) }
+        if s.hasPrefix("localhost") || s.hasPrefix("127.0.0.1") { return URL(string: "http://" + s) }
+        if !s.contains(" "), s.contains(".") { return URL(string: "https://" + s) }
+        var c = URLComponents(string: startPage + "/")!
+        c.queryItems = [.init(name: "q", value: s)]
+        return c.url
+    }
+
+    private func session(owning web: WKWebView) -> BrowserSession? {
+        sessions.values.first { $0.owns(web) }
+    }
+
+    // target=_blank / window.open: a browser tab gets a new page tab built from
+    // WebKit's configuration (keeps window.opener); pinned panes load in place
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let s = session(owning: webView) { return s.open(configuration: configuration).web }
         if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
         return nil
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let s = session(owning: webView),
+              let i = s.pages.firstIndex(where: { $0.web === webView }) else { return }
+        s.close(at: i)
+    }
+
+    // ⌘-click a link: open it in a background page tab
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.contains(.command),
+           let s = session(owning: webView) {
+            decisionHandler(.cancel)
+            s.open(request: navigationAction.request, select: false)
+            return
+        }
+        decisionHandler(.allow)
     }
 
     func web(for tab: TabSpec) -> WKWebView {
         if let w = webs[tab.name] { return w }
         let w = WKWebView(frame: .zero)
         w.uiDelegate = self
-        var s = tab.url ?? ""
-        if !s.isEmpty && !s.contains("://") { s = "https://" + s }
-        if let u = URL(string: s) { w.load(URLRequest(url: u)) }
+        if let u = Self.url(from: tab.url ?? "") { w.load(URLRequest(url: u)) }
         webs[tab.name] = w
         return w
     }
 
-    func shutdown(_ name: String) { _ = webs.removeValue(forKey: name) }
-    func shutdownAll() { webs.removeAll() }
+    func session(for tab: TabSpec) -> BrowserSession {
+        if let s = sessions[tab.name] { return s }
+        let s = BrowserSession(tab: tab)
+        sessions[tab.name] = s
+        return s
+    }
+
+    // tab removed: its pages and their restore list go too
+    func shutdown(_ name: String) {
+        _ = webs.removeValue(forKey: name)
+        _ = sessions.removeValue(forKey: name)
+        UserDefaults.standard.removeObject(forKey: BrowserSession.key(name))
+    }
+    // app quit: keep restore lists
+    func shutdownAll() { webs.removeAll(); sessions.removeAll() }
+}
+
+// the page tabs inside one browser tab; open urls + selection are saved so
+// they come back after a relaunch
+final class BrowserSession: ObservableObject {
+    let name: String
+    @Published private(set) var pages: [WebNav] = []
+    @Published var current = 0 { didSet { save() } }
+    private var restoring = true
+
+    static func key(_ name: String) -> String { "browser." + name }
+
+    init(tab: TabSpec) {
+        name = tab.name
+        let saved = UserDefaults.standard.dictionary(forKey: Self.key(name))
+        var urls = saved?["urls"] as? [String] ?? []
+        if urls.isEmpty { urls = [tab.url ?? WebHost.startPage] }
+        for u in urls { open(url: u) }
+        current = min(max(saved?["current"] as? Int ?? 0, 0), pages.count - 1)
+        restoring = false
+        save()
+    }
+
+    var selected: WebNav { pages[current] }
+    func owns(_ web: WKWebView) -> Bool { pages.contains { $0.web === web } }
+
+    // new page after the current one (appended while restoring)
+    @discardableResult
+    func open(configuration: WKWebViewConfiguration? = nil, request: URLRequest? = nil,
+              url: String? = nil, select: Bool = true) -> WebNav {
+        let w = configuration.map { WKWebView(frame: .zero, configuration: $0) } ?? WKWebView(frame: .zero)
+        w.uiDelegate = WebHost.shared
+        w.navigationDelegate = WebHost.shared
+        let nav = WebNav(w)
+        nav.onURLChange = { [weak self] in self?.save() }
+        let i = restoring ? pages.count : current + 1
+        pages.insert(nav, at: i)
+        if let request { w.load(request) } else if let u = url.flatMap(WebHost.url(from:)) {
+            w.load(URLRequest(url: u))
+        }
+        if select && !restoring { current = i } else if i <= current && !restoring { current += 1 }
+        save()
+        return nav
+    }
+
+    // closing the last page leaves a fresh start page, like an empty browser window
+    func close(at i: Int) {
+        guard pages.indices.contains(i) else { return }
+        if pages.count == 1 {
+            pages[0].go(WebHost.startPage)
+            return
+        }
+        pages.remove(at: i)
+        if current > i || current == pages.count { current -= 1 } else { save() }
+    }
+
+    func cycle(_ step: Int) {
+        current = (current + step + pages.count) % pages.count
+    }
+
+    private func save() {
+        guard !restoring else { return }
+        UserDefaults.standard.set(
+            ["urls": pages.map(\.url).filter { !$0.isEmpty }, "current": current],
+            forKey: Self.key(name))
+    }
+}
+
+// KVO bridge so the address bar and page tab track the page (links, redirects, history)
+final class WebNav: ObservableObject, Identifiable {
+    let web: WKWebView
+    @Published var url = ""
+    @Published var title = ""
+    @Published var canGoBack = false
+    @Published var canGoForward = false
+    @Published var loading = false
+    var onURLChange: (() -> Void)?
+    private var observers: [NSKeyValueObservation] = []
+
+    init(_ web: WKWebView) {
+        self.web = web
+        let sync: (WKWebView) -> Void = { [weak self] w in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let u = w.url?.absoluteString ?? ""
+                if u != self.url { self.url = u; self.onURLChange?() }
+                self.title = w.title ?? ""
+                self.canGoBack = w.canGoBack
+                self.canGoForward = w.canGoForward
+                self.loading = w.isLoading
+            }
+        }
+        observers = [
+            web.observe(\.url, options: [.initial]) { w, _ in sync(w) },
+            web.observe(\.title) { w, _ in sync(w) },
+            web.observe(\.canGoBack) { w, _ in sync(w) },
+            web.observe(\.canGoForward) { w, _ in sync(w) },
+            web.observe(\.isLoading) { w, _ in sync(w) },
+        ]
+    }
+
+    var label: String {
+        if !title.isEmpty { return title }
+        return URL(string: url)?.host() ?? "new tab"
+    }
+
+    func go(_ input: String) {
+        if let u = WebHost.url(from: input) { web.load(URLRequest(url: u)) }
+    }
 }
 
 struct WebPane: NSViewRepresentable {
     let tab: TabSpec
     func makeNSView(context: Context) -> WKWebView { WebHost.shared.web(for: tab) }
     func updateNSView(_ view: WKWebView, context: Context) {}
+}
+
+struct PageView: NSViewRepresentable {
+    let web: WKWebView
+    func makeNSView(context: Context) -> WKWebView { web }
+    func updateNSView(_ view: WKWebView, context: Context) {}
+}
+
+// browser tab: page-tab strip, address bar (‹ › ↻ + url/search), page.
+// ⌘T new page, ⌘W close page, ⌘L address bar, ⌘⇧[ / ⌘⇧] previous/next page
+struct BrowserPane: View {
+    @ObservedObject var session: BrowserSession
+    @ObservedObject var store: Store
+    @FocusState private var addressFocus: Bool
+
+    var body: some View {
+        let page = session.selected
+        VStack(spacing: 6) {
+            pageStrip
+            AddressBar(nav: page, store: store, focus: $addressFocus)
+                .id(page.id)
+            PageView(web: page.web)
+                .id(page.id)
+        }
+        .background { shortcuts }
+    }
+
+    var pageStrip: some View {
+        let t = store.theme
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(Array(session.pages.enumerated()), id: \.element.id) { i, nav in
+                    PageChip(nav: nav, active: i == session.current, store: store,
+                             select: { session.current = i },
+                             close: { session.close(at: i) })
+                }
+                Button { newPage() } label: {
+                    Text("+")
+                        .font(mono(11, .bold))
+                        .foregroundStyle(Color(nsColor: t.dim))
+                        .padding(.horizontal, 6)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(height: 18)
+    }
+
+    // key equivalents only; invisible and unclickable
+    var shortcuts: some View {
+        Group {
+            Button("") { newPage() }.keyboardShortcut("t")
+            Button("") { session.close(at: session.current) }.keyboardShortcut("w")
+            Button("") { addressFocus = true }.keyboardShortcut("l")
+            Button("") { session.cycle(1) }.keyboardShortcut("]", modifiers: [.command, .shift])
+            Button("") { session.cycle(-1) }.keyboardShortcut("[", modifiers: [.command, .shift])
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+    }
+
+    func newPage() {
+        session.open(url: WebHost.startPage)
+        // the address bar is rebuilt for the new page; focus it once it exists
+        DispatchQueue.main.async { addressFocus = true }
+    }
+}
+
+struct PageChip: View {
+    @ObservedObject var nav: WebNav
+    let active: Bool
+    @ObservedObject var store: Store
+    let select: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        let t = store.theme
+        HStack(spacing: 5) {
+            Text(nav.loading ? "◌" : "")
+                .frame(width: nav.loading ? nil : 0)
+            Text(nav.label)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Button(action: close) { Text("✕") }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color(nsColor: active ? t.ink : t.dim))
+        }
+        .font(mono(9, active ? .semibold : .regular))
+        .frame(maxWidth: 150)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(
+            active ? Color(nsColor: t.paper).opacity(0.85) : Color(nsColor: t.paper).opacity(0.07),
+            in: RoundedRectangle(cornerRadius: store.chipRadius))
+        .foregroundStyle(active ? Color(nsColor: t.ink) : Color(nsColor: t.dim))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: select)
+        .help(nav.url)
+    }
+}
+
+struct AddressBar: View {
+    @ObservedObject var nav: WebNav
+    @ObservedObject var store: Store
+    var focus: FocusState<Bool>.Binding
+    @State private var address = ""
+
+    var body: some View {
+        let t = store.theme
+        HStack(spacing: 8) {
+            navButton("‹", enabled: nav.canGoBack) { nav.web.goBack() }
+            navButton("›", enabled: nav.canGoForward) { nav.web.goForward() }
+            navButton(nav.loading ? "✕" : "↻", enabled: true) {
+                if nav.loading { nav.web.stopLoading() } else { nav.web.reload() }
+            }
+            TextField("search or url", text: $address)
+                .textFieldStyle(.plain)
+                .font(mono(11))
+                .foregroundStyle(Color(nsColor: t.paper))
+                .focused(focus)
+                .onSubmit { nav.go(address); focus.wrappedValue = false }
+                .onExitCommand { address = nav.url; focus.wrappedValue = false }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    Color(nsColor: t.paper).opacity(0.07),
+                    in: RoundedRectangle(cornerRadius: store.chipRadius))
+        }
+        .onAppear { address = nav.url }
+        .onChange(of: nav.url) { _, new in if !focus.wrappedValue { address = new } }
+    }
+
+    func navButton(_ glyph: String, enabled: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(glyph)
+                .font(mono(12, .bold))
+                .foregroundStyle(Color(nsColor: enabled ? store.theme.paper : store.theme.dim))
+                .frame(width: 14)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
 }
 
 // MARK: - Views
@@ -722,13 +1040,16 @@ struct IslandView: View {
             NotesPane(store: store).id(tab.name)
         } else if tab.isWidget {
             WidgetPane(tab: tab).id(tab.name)
+        } else if tab.isBrowser {
+            BrowserPane(session: WebHost.shared.session(for: tab), store: store)
+                .id(tab.name)
         } else if tab.isWeb {
             WebPane(tab: tab)
                 .id(tab.name)
                 .contextMenu {
                     Button("Back") { WebHost.shared.webs[tab.name]?.goBack() }
                     Button("Reload") { WebHost.shared.webs[tab.name]?.reload() }
-                    if let s = tab.url, let u = URL(string: s.contains("://") ? s : "https://" + s) {
+                    if let s = tab.url, let u = WebHost.url(from: s) {
                         Button("Open in Browser") { NSWorkspace.shared.open(u) }
                     }
                 }
@@ -814,7 +1135,7 @@ struct IslandView: View {
     }
 
     func paneGlyph(_ tab: TabSpec) -> String {
-        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isWeb ? "◎" : "❯"
+        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isBrowser ? "⊕" : tab.isWeb ? "◎" : "❯"
     }
 
     // + card: one-click chips for tools found on PATH, custom row below.
@@ -855,7 +1176,7 @@ struct IslandView: View {
                     .foregroundStyle(Color(nsColor: t.dim))
             }
             HStack(spacing: 8) {
-                TextField("command, e.g. dbq dev", text: $newCommand)
+                TextField("command or https:// url", text: $newCommand)
                     .focused($commandFocus)
                 TextField(newCommand.isEmpty ? "name" : derivedName, text: $newName)
                     .frame(width: 76)
@@ -887,29 +1208,35 @@ struct IslandView: View {
         }
     }
 
-    // PATH tools + the built-in pane types, minus tabs that already exist
+    // PATH tools + the built-in pane types; all repeatable (numbered) except
+    // Notes, which is one shared notes.md
     var suggestions: [String] {
-        (store.foundTools + ["Shell", "Notes"]).filter { s in
-            !store.tabs.contains { $0.name.caseInsensitiveCompare(s) == .orderedSame }
+        (store.foundTools + ["Browser", "Shell", "Notes"]).filter { s in
+            s != "Notes" || !store.tabs.contains(where: \.isNotes)
         }
     }
 
     func addSuggestion(_ s: String) {
+        let name = store.uniqueName(s)
         switch s {
-        case "Notes": store.addTab(name: "Notes", command: "", notes: true)
-        case "Shell": store.addTab(name: "Shell", command: "", notes: false)
-        default: store.addTab(name: s, command: s, notes: false)
+        case "Notes": store.addTab(name: name, command: "", notes: true)
+        case "Shell": store.addTab(name: name, command: "", notes: false)
+        case "Browser": store.addTab(.init(name: name, type: "browser"))
+        default: store.addTab(name: name, command: s, notes: false)
         }
         cancelNewTab()
     }
 
     // name left blank → the command itself (or "Shell"), suffixed until unique
+    var newURL: String? {
+        let cmd = newCommand.trimmingCharacters(in: .whitespaces)
+        return cmd.hasPrefix("http://") || cmd.hasPrefix("https://") ? cmd : nil
+    }
+
     var derivedName: String {
         let cmd = newCommand.trimmingCharacters(in: .whitespaces)
-        let base = cmd.isEmpty ? "Shell" : cmd
-        var n = base, i = 2
-        while store.tabs.contains(where: { $0.name == n }) { n = "\(base) \(i)"; i += 1 }
-        return n
+        let host = newURL.flatMap { URL(string: $0)?.host() }
+        return store.uniqueName(host ?? (cmd.isEmpty ? "Shell" : cmd))
     }
 
     var tabName: String {
@@ -921,7 +1248,11 @@ struct IslandView: View {
 
     func submitNewTab() {
         guard canAdd else { return }
-        store.addTab(name: tabName, command: newCommand, notes: false)
+        if let url = newURL {
+            store.addTab(.init(name: tabName, type: "browser", url: url))
+        } else {
+            store.addTab(name: tabName, command: newCommand, notes: false)
+        }
         cancelNewTab()
     }
 
