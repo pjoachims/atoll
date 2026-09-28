@@ -1471,7 +1471,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &bag)
         setExpanded(false)
         panel.orderFrontRegardless()
-        startLauncherWatch()
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.typedSinceExpand = true
@@ -1624,14 +1623,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // floating level that overlaps us, drop just beneath its layer; restore
     // once it's gone. Floating (3) and below is left alone so persistent
     // utility windows (PiP, reminders) don't keep us sunk. Their panels don't
-    // activate, so nothing notifies us — poll the (cheap) on-screen list.
+    // activate, so nothing notifies us — poll the on-screen list. Only while
+    // expanded: the collapsed pill sits in the notch where launchers don't
+    // reach, and an always-on poll was the app's main idle battery cost.
     var launcherTimer: Timer?
 
     func startLauncherWatch() {
+        guard launcherTimer == nil else { return }
+        yieldToOverlays()
         let t = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in self?.yieldToOverlays() }
         t.tolerance = 0.05
         RunLoop.main.add(t, forMode: .common)
         launcherTimer = t
+    }
+
+    func stopLauncherWatch() {
+        launcherTimer?.invalidate()
+        launcherTimer = nil
+        panel.level = .statusBar
     }
 
     func yieldToOverlays() {
@@ -1732,6 +1741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wasExpanded = store.expanded
         if e && !wasExpanded { store.reloadTabs() }
         store.expanded = e
+        if e { startLauncherWatch() } else { stopLauncherWatch() }
         // hand the keyboard back to whatever app had it before auto-focus
         if !e, panel.isKeyWindow { panel.orderOut(nil) }
         let sc = screen
