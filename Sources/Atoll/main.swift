@@ -71,6 +71,7 @@ func currentTheme() -> Theme {
 //   type "browser" same, plus an address bar and back/forward; `url` is the start page
 //   type "window" another app's own window parked under the tab bar; `app` is
 //                 its bundle id, name or .app path (defaults to the tab name)
+//   type "herd"   herdr's screen, drawn from herdr-core (`hc`): see Herd.swift
 struct TabSpec: Codable, Equatable {
     var name: String
     var command: String?
@@ -83,6 +84,7 @@ struct TabSpec: Codable, Equatable {
     var isBrowser: Bool { type == "browser" }
     var isWeb: Bool { type == "web" || isBrowser }
     var isWindow: Bool { type == "window" }
+    var isHerd: Bool { type == "herd" }
 }
 
 enum Config {
@@ -277,7 +279,7 @@ final class Store: ObservableObject {
     @Published var foundTools: [String] = []
 
     func scanTools() {
-        let candidates = ["herdr", "lazygit", "btop", "htop", "k9s", "yazi", "ranger"]
+        let candidates = ["hc", "herdr", "lazygit", "btop", "htop", "k9s", "yazi", "ranger"]
         DispatchQueue.global().async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -357,6 +359,12 @@ final class Store: ObservableObject {
 // MARK: - Embedded terminal panes
 
 final class IslandTerminalView: LocalProcessTerminalView {
+    // herd panes draw herdr's scrollbar from this
+    override func scrolled(source: TerminalView, position: Double) {
+        super.scrolled(source: source, position: position)
+        NotificationCenter.default.post(name: .atollPaneScrolled, object: self)
+    }
+
     // accessory app has no Edit menu, so ⌘V/⌘+/⌘- never reach their actions on their own
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.command) {
@@ -415,6 +423,10 @@ final class IslandTerminalView: LocalProcessTerminalView {
     }
 }
 
+func cleanEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+    env.filter { !$0.key.hasPrefix("HERDR_") && !$0.key.hasPrefix("HC_") }
+}
+
 // One live terminal per tab, spawned on first use and kept running across
 // tab switches; only the selected one is attached to the view hierarchy.
 // Terminal panes share the theme ink so the island reads as one slab
@@ -459,9 +471,10 @@ final class PaneHost: NSObject, LocalProcessTerminalViewDelegate {
         t.font = paneFont(fontSize)
         t.nativeBackgroundColor = terminalBG
         var env = ProcessInfo.processInfo.environment
-        // `open` from a herdr pane leaks HERDR_* into the app; panes would then
-        // look like nested herdr sessions
-        for k in env.keys where k.hasPrefix("HERDR_") { env.removeValue(forKey: k) }
+        // `open` from a herdr pane leaks HERDR_*/HC_* into the app; panes would
+        // then look like nested herdr sessions, and `hc attach` would refuse
+        // to attach "to itself"
+        env = cleanEnvironment(env)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         let cwd = Config.launchDir
@@ -1172,6 +1185,8 @@ struct IslandView: View {
             NotesPane(store: store).id(tab.name)
         } else if tab.isWindow {
             WindowPane(tab: tab, store: store).id(tab.name)
+        } else if tab.isHerd {
+            HerdPane(store: store, host: HerdHost.shared).id(tab.name)
         } else if tab.isWidget {
             WidgetPane(tab: tab).id(tab.name)
         } else if tab.isBrowser {
@@ -1218,7 +1233,7 @@ struct IslandView: View {
                 .contextMenu {
                     Button("Remove \"\(tab.name)\"") { store.removeTab(tab.name) }
                     // same command, no pty: turn a one-shot tool into a live island
-                    if !tab.isNotes && !tab.isWeb && !tab.isWindow {
+                    if !tab.isNotes && !tab.isWeb && !tab.isWindow && !tab.isHerd {
                         Button(tab.isWidget ? "Use as Terminal" : "Use as Widget") {
                             store.convertTab(tab)
                         }
@@ -1254,6 +1269,9 @@ struct IslandView: View {
                     .lineLimit(1)
             } else {
                 HStack(spacing: 4) {
+                    if store.tabs.contains(where: \.isHerd) {
+                        HerdDots(host: HerdHost.shared)
+                    }
                     ForEach(store.tabs.filter { store.livePanes.contains($0.name) }, id: \.name) { tab in
                         RoundedRectangle(cornerRadius: 1)
                             .fill(tab.name == store.selected
@@ -1269,7 +1287,7 @@ struct IslandView: View {
     }
 
     func paneGlyph(_ tab: TabSpec) -> String {
-        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isBrowser ? "⊕" : tab.isWeb ? "◎" : tab.isWindow ? "▣" : "❯"
+        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isBrowser ? "⊕" : tab.isWeb ? "◎" : tab.isWindow ? "▣" : tab.isHerd ? "◈" : "❯"
     }
 
     // + card: one-click chips for tools found on PATH, custom row below.
@@ -1345,7 +1363,8 @@ struct IslandView: View {
     // PATH tools + the built-in pane types; all repeatable (numbered) except
     // Notes, which is one shared notes.md
     var suggestions: [String] {
-        (store.foundTools + ["Browser", "Shell", "Notes"]).filter { s in
+        // hc on PATH: offer the native agent list rather than its picker TUI
+        (store.foundTools.map { $0 == "hc" ? "Herd" : $0 } + ["Browser", "Shell", "Notes"]).filter { s in
             s != "Notes" || !store.tabs.contains(where: \.isNotes)
         }
     }
@@ -1356,6 +1375,7 @@ struct IslandView: View {
         case "Notes": store.addTab(name: name, command: "", notes: true)
         case "Shell": store.addTab(name: name, command: "", notes: false)
         case "Browser": store.addTab(.init(name: name, type: "browser"))
+        case "Herd": store.addTab(.init(name: name, type: "herd"))
         default: store.addTab(name: name, command: s, notes: false)
         }
         cancelNewTab()
@@ -1543,7 +1563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = hosting
         // opt-in warm start: boot the selected pane's process before the first
         // expand. Default is cold: nothing spawns until the user expands.
-        if store.warmStart, !store.selectedTab.isNotes, !store.selectedTab.isWindow {
+        if store.warmStart, !store.selectedTab.isNotes, !store.selectedTab.isWindow, !store.selectedTab.isHerd {
             _ = PaneHost.shared.terminal(for: store.selectedTab)
         }
         store.scanTools() // populate the + card's suggestions
@@ -1554,6 +1574,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         store.livePanes = Set(PaneHost.shared.terms.keys)
+        HerdHost.shared.onAlert = { [weak self] msg in self?.store.showFlash(msg) }
+        store.$tabs
+            .receive(on: DispatchQueue.main)
+            .sink { HerdHost.shared.setEnabled($0.contains(where: \.isHerd)) }
+            .store(in: &bag)
         applyHotKey()
         store.$hotkey
             .dropFirst()
@@ -1736,6 +1761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var typedSinceExpand = false
 
     func applicationWillTerminate(_ notification: Notification) {
+        HerdHost.shared.setEnabled(false)
         PaneHost.shared.shutdownAll()
         WebHost.shared.shutdownAll()
     }
@@ -1903,8 +1929,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.store.expanded, !self.store.selectedTab.isWindow else { return }
             self.panel.makeKey()
             // notes pane focuses itself via @FocusState once the panel is key
+            // herd: the attached agent, if any
+            let key = self.store.selectedTab.isHerd
+                ? HerdHost.shared.focusedPane.map { "herd:" + $0 } ?? ""
+                : self.store.selected
             if !self.store.selectedTab.isNotes,
-               let t = PaneHost.shared.terms[self.store.selected] {
+               let t = PaneHost.shared.terms[key] {
                 self.panel.makeFirstResponder(t)
             }
         }
