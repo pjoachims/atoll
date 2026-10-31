@@ -69,16 +69,20 @@ func currentTheme() -> Theme {
 //   type "widget" polled `command` output rendered as text, every `refresh`s
 //   type "web"    WKWebView pinned to `url` (session survives tab switches)
 //   type "browser" same, plus an address bar and back/forward; `url` is the start page
+//   type "window" another app's own window parked under the tab bar; `app` is
+//                 its bundle id, name or .app path (defaults to the tab name)
 struct TabSpec: Codable, Equatable {
     var name: String
     var command: String?
     var type: String?
     var url: String?
     var refresh: Int?
+    var app: String?
     var isNotes: Bool { type == "notes" }
     var isWidget: Bool { type == "widget" }
     var isBrowser: Bool { type == "browser" }
     var isWeb: Bool { type == "web" || isBrowser }
+    var isWindow: Bool { type == "window" }
 }
 
 enum Config {
@@ -265,6 +269,8 @@ final class Store: ObservableObject {
     }
 
     var selectedTab: TabSpec { tabs.first { $0.name == selected } ?? tabs[0] }
+    // island is just its tab bar, the selected app's window hangs below it
+    var windowMode: Bool { expanded && selectedTab.isWindow && !addingTab && WindowHost.shared.trusted }
 
     @Published var addingTab = false
     // CLI tools found on PATH, offered as one-click tabs in the + card
@@ -958,6 +964,131 @@ struct AddressBar: View {
     }
 }
 
+// MARK: - Window tabs
+//
+// macOS can't reparent another app's window into ours, so a window tab
+// shrinks the island to its tab bar and parks the app's own window right
+// under it through the Accessibility API. Collapsing hides the app again.
+final class WindowHost {
+    static let shared = WindowHost()
+    // what is parked under the island right now; `frame` is in Cocoa coordinates
+    private(set) var shown: (name: String, app: NSRunningApplication, frame: NSRect)?
+    private var wanted: String? // async launch/reopen retries bail once this moves on
+    private var prompted = false
+
+    var trusted: Bool { AXIsProcessTrusted() }
+
+    // system "allow Accessibility" dialog, once per launch
+    func requestTrust() {
+        guard !trusted, !prompted else { return }
+        prompted = true
+        let opt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        _ = AXIsProcessTrustedWithOptions([opt: true] as CFDictionary)
+    }
+
+    func key(_ tab: TabSpec) -> String { tab.app ?? tab.name }
+
+    func running(_ tab: TabSpec) -> NSRunningApplication? {
+        let k = (key(tab) as NSString).expandingTildeInPath
+        return NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == k || $0.localizedName == k || $0.bundleURL?.path == k
+        }
+    }
+
+    func appURL(_ tab: TabSpec) -> URL? {
+        let k = (key(tab) as NSString).expandingTildeInPath
+        if k.hasSuffix(".app") { return URL(fileURLWithPath: k) }
+        if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: k) { return u }
+        return ["/Applications", NSHomeDirectory() + "/Applications", "/System/Applications"]
+            .map { URL(fileURLWithPath: $0 + "/" + k + ".app") }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    func show(_ tab: TabSpec, in frame: NSRect, attempt: Int = 0) {
+        guard trusted else { return }
+        if attempt == 0 {
+            if let s = shown, s.name == tab.name, s.frame == frame, !s.app.isHidden, !s.app.isTerminated {
+                return
+            }
+            wanted = tab.name
+        }
+        guard wanted == tab.name, attempt < 12 else { return }
+        let retry = { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self?.show(tab, in: frame, attempt: attempt + 1)
+            }
+        }
+        // not running, or running without a window: opening it again launches
+        // it or makes it reopen a window, then we try to grab one
+        guard let app = running(tab), let win = window(of: app) else {
+            if attempt == 0 || attempt == 4, let url = appURL(tab) {
+                let cfg = NSWorkspace.OpenConfiguration()
+                cfg.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in }
+            }
+            retry()
+            return
+        }
+        shown = (tab.name, app, frame)
+        app.unhide()
+        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        // AX coordinates: top-left origin on the primary screen
+        let primaryTop = NSScreen.screens[0].frame.maxY
+        var pos = CGPoint(x: frame.minX, y: primaryTop - frame.maxY)
+        var size = frame.size
+        // size, move, size again: a window clamped by the old position resizes short
+        for attr in [kAXSizeAttribute, kAXPositionAttribute, kAXSizeAttribute] {
+            let v = attr == kAXPositionAttribute
+                ? AXValueCreate(.cgPoint, &pos) : AXValueCreate(.cgSize, &size)
+            if let v { AXUIElementSetAttributeValue(win, attr as CFString, v) }
+        }
+        AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+        app.activate()
+    }
+
+    func hide() {
+        wanted = nil
+        guard let s = shown else { return }
+        shown = nil
+        s.app.hide()
+    }
+
+    func window(of app: NSRunningApplication) -> AXUIElement? {
+        let el = AXUIElementCreateApplication(app.processIdentifier)
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXWindowsAttribute as CFString, &ref) == .success,
+              let wins = ref as? [AXUIElement], !wins.isEmpty
+        else { return nil }
+        return wins.first { w in
+            var sub: CFTypeRef?
+            AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &sub)
+            return sub as? String == kAXStandardWindowSubrole as String
+        } ?? wins[0]
+    }
+}
+
+struct WindowPane: View {
+    let tab: TabSpec
+    @ObservedObject var store: Store
+
+    // only on screen while Accessibility is missing (or the + card is up);
+    // otherwise the pane has zero height and the app's window sits below
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("\(WindowHost.shared.key(tab)) opens under this tab")
+                .font(mono(12, .semibold))
+                .foregroundStyle(Color(nsColor: store.theme.paper))
+            if !WindowHost.shared.trusted {
+                Text("Atoll needs Accessibility access to move its window.\nSystem Settings › Privacy & Security › Accessibility, then collapse and expand.")
+                    .font(mono(10))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Color(nsColor: store.theme.dim))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 // MARK: - Views
 
 struct IslandView: View {
@@ -986,7 +1117,8 @@ struct IslandView: View {
                     VStack(spacing: 6) {
                         tabBar
                         pane
-                            .frame(width: store.termW, height: store.termH)
+                            .frame(width: store.termW, height: store.windowMode ? 0 : store.termH)
+                            .clipped()
                             .overlay(alignment: .top) {
                                 if store.addingTab { addCard.padding(.top, 4) }
                             }
@@ -1038,6 +1170,8 @@ struct IslandView: View {
         let tab = store.selectedTab
         if tab.isNotes {
             NotesPane(store: store).id(tab.name)
+        } else if tab.isWindow {
+            WindowPane(tab: tab, store: store).id(tab.name)
         } else if tab.isWidget {
             WidgetPane(tab: tab).id(tab.name)
         } else if tab.isBrowser {
@@ -1084,7 +1218,7 @@ struct IslandView: View {
                 .contextMenu {
                     Button("Remove \"\(tab.name)\"") { store.removeTab(tab.name) }
                     // same command, no pty: turn a one-shot tool into a live island
-                    if !tab.isNotes && !tab.isWeb {
+                    if !tab.isNotes && !tab.isWeb && !tab.isWindow {
                         Button(tab.isWidget ? "Use as Terminal" : "Use as Widget") {
                             store.convertTab(tab)
                         }
@@ -1135,7 +1269,7 @@ struct IslandView: View {
     }
 
     func paneGlyph(_ tab: TabSpec) -> String {
-        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isBrowser ? "⊕" : tab.isWeb ? "◎" : "❯"
+        tab.isNotes ? "✎" : tab.isWidget ? "↻" : tab.isBrowser ? "⊕" : tab.isWeb ? "◎" : tab.isWindow ? "▣" : "❯"
     }
 
     // + card: one-click chips for tools found on PATH, custom row below.
@@ -1176,7 +1310,7 @@ struct IslandView: View {
                     .foregroundStyle(Color(nsColor: t.dim))
             }
             HStack(spacing: 8) {
-                TextField("command or https:// url", text: $newCommand)
+                TextField("command, https:// url or .app", text: $newCommand)
                     .focused($commandFocus)
                 TextField(newCommand.isEmpty ? "name" : derivedName, text: $newName)
                     .frame(width: 76)
@@ -1233,10 +1367,17 @@ struct IslandView: View {
         return cmd.hasPrefix("http://") || cmd.hasPrefix("https://") ? cmd : nil
     }
 
+    // "/Applications/Herdr.app" → a window tab for that app
+    var newApp: String? {
+        let cmd = newCommand.trimmingCharacters(in: .whitespaces)
+        return cmd.hasSuffix(".app") ? cmd : nil
+    }
+
     var derivedName: String {
         let cmd = newCommand.trimmingCharacters(in: .whitespaces)
         let host = newURL.flatMap { URL(string: $0)?.host() }
-        return store.uniqueName(host ?? (cmd.isEmpty ? "Shell" : cmd))
+        let app = newApp.map { (($0 as NSString).lastPathComponent as NSString).deletingPathExtension }
+        return store.uniqueName(host ?? app ?? (cmd.isEmpty ? "Shell" : cmd))
     }
 
     var tabName: String {
@@ -1250,6 +1391,8 @@ struct IslandView: View {
         guard canAdd else { return }
         if let url = newURL {
             store.addTab(.init(name: tabName, type: "browser", url: url))
+        } else if let app = newApp {
+            store.addTab(.init(name: tabName, type: "window", app: app))
         } else {
             store.addTab(name: tabName, command: newCommand, notes: false)
         }
@@ -1400,7 +1543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = hosting
         // opt-in warm start: boot the selected pane's process before the first
         // expand. Default is cold: nothing spawns until the user expands.
-        if store.warmStart, !store.selectedTab.isNotes {
+        if store.warmStart, !store.selectedTab.isNotes, !store.selectedTab.isWindow {
             _ = PaneHost.shared.terminal(for: store.selectedTab)
         }
         store.scanTools() // populate the + card's suggestions
@@ -1452,7 +1595,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] adding in
-                guard let self, adding else { return }
+                guard let self else { return }
+                // the + card needs the full island; a window tab gets it back after
+                if self.store.expanded { self.setExpanded(true) }
+                guard adding else { return }
                 self.typedSinceExpand = true // pin open while the form is up
                 self.panel.makeKey()
                 // steal the keyboard back from the pane so @FocusState can take it
@@ -1466,6 +1612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self, self.store.expanded else { return }
+                self.setExpanded(true) // window tabs change the island's height
                 self.focusPrompt()
             }
             .store(in: &bag)
@@ -1475,6 +1622,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.typedSinceExpand = true
             return e
+        }
+        // a click into a window tab's app pins the island like typing does
+        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            if let f = WindowHost.shared.shown?.frame, f.contains(NSEvent.mouseLocation) {
+                self?.typedSinceExpand = true
+            }
         }
 
         // collapse when keyboard focus leaves the embedded pane (click in another app)
@@ -1610,8 +1763,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // below-menu-bar mode: the island hangs under the notch, so a cursor
             // parked in the notch is outside the frame but still "on" the island
             if self.notchRect.contains(m) { return }
-            // pinned only when the user actually typed into the pane
-            if self.panel.isKeyWindow && self.typedSinceExpand { return }
+            if let f = WindowHost.shared.shown?.frame, f.insetBy(dx: -8, dy: -8).contains(m) { return }
+            // pinned only when the user actually typed into the pane (or clicked
+            // into a window tab's app, which then stays frontmost)
+            let windowActive = WindowHost.shared.shown?.app.isActive == true
+            if (self.panel.isKeyWindow || windowActive) && self.typedSinceExpand { return }
             self.collapseTimer?.invalidate()
             self.collapseTimer = nil
             self.setExpanded(false)
@@ -1694,6 +1850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wasExpanded = store.expanded
         if e && !wasExpanded { store.reloadTabs() }
         store.expanded = e
+        if e && store.selectedTab.isWindow { WindowHost.shared.requestTrust() }
+        let windowMode = store.windowMode
         // Expanded below the menu bar: sit just under Raycast (8), so it,
         // Spotlight (23) and notification banners open above us. The pill and
         // the over-menu-bar island must cover the menu bar (24) instead.
@@ -1706,7 +1864,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var top: CGFloat = 0 // gap between screen top and the panel
         if e {
             w = max(notchW + 40, store.termW + 24)
-            h = min(topPad + 8 + tabBarH + store.termH + 16, sc.frame.height * 0.8)
+            h = windowMode
+                ? topPad + 8 + tabBarH + 4
+                : min(topPad + 8 + tabBarH + store.termH + 16, sc.frame.height * 0.8)
             top = notchH - topPad
         } else {
             w = store.overMenuBar ? notchW + 16 : notchW // exact notch = invisible
@@ -1723,6 +1883,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 animate: e != wasExpanded || (!e && panel.frame.width > 0))
         }
         if !panel.isVisible { panel.orderFrontRegardless() }
+        if windowMode {
+            WindowHost.shared.show(
+                store.selectedTab,
+                in: NSRect(x: f.minX, y: f.minY - store.termH - 16, width: f.width, height: store.termH + 16))
+        } else {
+            WindowHost.shared.hide()
+        }
         if e && !wasExpanded {
             typedSinceExpand = false
             if store.autoFocus { focusPrompt() }
@@ -1732,7 +1899,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // cursor straight into the selected pane — type immediately
     func focusPrompt() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self, self.store.expanded else { return }
+            // a window tab's app has the keyboard; taking it back would bury it
+            guard let self, self.store.expanded, !self.store.selectedTab.isWindow else { return }
             self.panel.makeKey()
             // notes pane focuses itself via @FocusState once the panel is key
             if !self.store.selectedTab.isNotes,
