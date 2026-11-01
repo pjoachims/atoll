@@ -1575,6 +1575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.livePanes = Set(PaneHost.shared.terms.keys)
         HerdHost.shared.onAlert = { [weak self] msg in self?.store.showFlash(msg) }
+        HerdHost.shared.onCollapse = { [weak self] in self?.setExpanded(false) }
         store.$tabs
             .receive(on: DispatchQueue.main)
             .sink { HerdHost.shared.setEnabled($0.contains(where: \.isHerd)) }

@@ -16,6 +16,7 @@ struct HerdAgent: Identifiable, Equatable {
     let id: String      // core address: t7, or box/t7 on an added machine
     var app: String
     var state: String?  // nil: the program never reported a status (plain shells)
+    var msg: String?    // what it said with its status: "Run migration on prod?"
     var title: String
     var place: String   // herdr's own "where" label: "repos_pj / 1"
     var spaceID: String?
@@ -29,6 +30,7 @@ struct HerdAgent: Identifiable, Equatable {
         let argv0 = (fg?["argv"] as? [String])?.first ?? (r["argv"] as? [String])?.first ?? "?"
         app = status?["app"] as? String ?? (argv0 as NSString).lastPathComponent
         state = status?["state"] as? String
+        msg = (status?["msg"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         title = r["title"] as? String ?? ""
         let labels = r["labels"] as? [String: Any]
         place = labels?["where"] as? String ?? id
@@ -215,6 +217,15 @@ final class HerdHost: ObservableObject {
     var keysActive = false // the herd pane is on screen
     // agent turned blocked or done after the first snapshot: flash the pill
     var onAlert: ((String) -> Void)?
+    var onCollapse: (() -> Void)?
+
+    // inbox (what needs you), one agent's pane, the composer, or herdr's whole screen
+    @Published var mode: HerdMode = UserDefaults.standard.bool(forKey: "herdFull") ? .full : .inbox {
+        didSet { UserDefaults.standard.set(mode == .full, forKey: "herdFull") }
+    }
+    @Published var inboxSelection: String?
+    @Published private(set) var changed: [String: Date] = [:] // last status change, for "12s"
+    var watchNext = false // the next space we create opens in focus
 
     private(set) var hc: String?
     private var herdrApp: String?
@@ -364,11 +375,14 @@ final class HerdHost: ObservableObject {
         guard let type = obj["type"] as? String, let addr = obj["terminal"] as? String else { return }
         let data = obj["data"] as? [String: Any] ?? [:]
         switch type {
-        case "created", "restarted": records[addr] = data
+        case "created", "restarted":
+            records[addr] = data
+            changed[addr] = Date()
         case "finished", "removed": records[addr] = nil
         case "status":
             records[addr]?["status"] = data["status"]
             seen.remove(addr)
+            changed[addr] = Date()
         case "title", "labels": records[addr]?[type] = data[type]
         case "foreground": records[addr]?["foreground"] = obj["data"]
         default: return
@@ -383,6 +397,7 @@ final class HerdHost: ObservableObject {
             for a in new.values where a.state == "blocked" || a.state == "done" {
                 guard agents[a.id]?.state != a.state, !visible.contains(a.id) else { continue }
                 let s = HerdState(a.state, seen: false)
+                if a.state == "blocked" { inboxSelection = a.id }
                 onAlert?("\(s.icon) \(a.place) · \(a.label) \(a.state == "blocked" ? "blocked" : "done")")
             }
         }
@@ -441,11 +456,19 @@ final class HerdHost: ObservableObject {
             if let s = spaces.first(where: { !before.contains($0.id) }) {
                 pending = nil
                 select(space: s.id, tab: s.tabs.first?.id, pane: s.tabs.first?.root.shown.first)
+                if watchNext, let t = s.tabs.first?.root.shown.first {
+                    watchNext = false
+                    mode = .focus(t)
+                }
             }
         case .tab(let sid, let before):
             if let t = spaces.first(where: { $0.id == sid })?.tabs.first(where: { !before.contains($0.id) }) {
                 pending = nil
                 select(space: sid, tab: t.id, pane: t.root.shown.first)
+                if watchNext, let p = t.root.shown.first {
+                    watchNext = false
+                    mode = .focus(p)
+                }
             }
         case .pane(let sid, let tid, let before):
             let tab = spaces.first { $0.id == sid }?.tabs.first { $0.id == tid }
@@ -590,13 +613,12 @@ final class HerdHost: ObservableObject {
     // MARK: actions (herdr-app does the work; the doc event brings it back)
 
     func newSpace() {
-        pending = .space(before: Set(spaces.map(\.id)))
-        app("space.new", space.map { ["folder": place(of: $0)] } ?? [:])
+        newSpace(space.map { ["folder": place(of: $0)] } ?? [:])
     }
 
-    func newTab(_ s: HerdSpace) {
+    func newTab(_ s: HerdSpace, _ extra: [String: Any] = [:]) {
         pending = .tab(space: s.id, before: Set(s.tabs.map(\.id)))
-        app("tab.new", ["space": s.id, "folder": place(of: s)])
+        app("tab.new", ["space": s.id, "folder": place(of: s)].merging(extra) { _, b in b })
     }
 
     func split(_ direction: String) {
@@ -638,25 +660,34 @@ final class HerdHost: ObservableObject {
             showToast("\(name(of: s)) is not in a git repository")
             return
         }
-        let repoName = (g.repo as NSString).lastPathComponent
-        guard let branch = HerdHost.ask("New worktree of \(repoName)", initial: "",
+        guard let branch = HerdHost.ask("New worktree of \((g.repo as NSString).lastPathComponent)", initial: "",
                                         detail: "Branch name: an existing branch, or a new one from HEAD.",
                                         button: "Create")?.trimmingCharacters(in: .whitespaces),
               !branch.isEmpty else { return }
+        addWorktree(g, branch: branch) { path in
+            // unnamed, so it follows the checkout folder and nests under the repo
+            self.newSpace(["folder": path])
+        }
+    }
+
+    func addWorktree(_ g: HerdGit, branch: String, then: @escaping (String) -> Void) {
         let slug = branch.replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        let path = NSHomeDirectory() + "/.herdr/worktrees/\(repoName)/\(slug)"
+        let path = NSHomeDirectory() + "/.herdr/worktrees/\((g.repo as NSString).lastPathComponent)/\(slug)"
         DispatchQueue.global(qos: .userInitiated).async {
             let exists = HerdHost.gitRun(g.repo, ["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"]).ok
             let add = exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"]
             let r = HerdHost.gitRun(g.root, add)
             DispatchQueue.main.async {
                 guard r.ok else { return self.showToast(r.err.isEmpty ? "git worktree add failed" : r.err) }
-                // unnamed, so it follows the checkout folder and nests under the repo
-                self.pending = .space(before: Set(self.spaces.map(\.id)))
-                self.app("space.new", ["folder": path])
+                then(path)
             }
         }
+    }
+
+    func newSpace(_ args: [String: Any]) {
+        pending = .space(before: Set(spaces.map(\.id)))
+        app("space.new", args)
     }
 
     // the space already showing a checkout, or a new one on it
@@ -665,8 +696,7 @@ final class HerdHost: ObservableObject {
         if let s = spaces.first(where: { inside(place(of: $0)) }) {
             select(space: s.id)
         } else {
-            pending = .space(before: Set(spaces.map(\.id)))
-            app("space.new", ["folder": c.path])
+            newSpace(["folder": c.path])
         }
     }
 
@@ -715,7 +745,7 @@ final class HerdHost: ObservableObject {
         }
     }
 
-    private func app(_ action: String, _ args: [String: Any], then: (() -> Void)? = nil) {
+    func app(_ action: String, _ args: [String: Any], then: (() -> Void)? = nil) {
         guard let herdrApp else {
             pending = nil
             showToast("herdr-app not on PATH: needed to change spaces, tabs and panes")
@@ -779,9 +809,14 @@ final class HerdHost: ObservableObject {
     private func handleKey(_ e: NSEvent) -> Bool {
         guard keysActive, e.window is IslandPanel else { return false }
         // text fields (renames, the + card) keep their keys
-        if e.window?.firstResponder is NSTextView { return false }
+        if e.window?.firstResponder is NSTextView { return mode == .compose && composeKey(e) }
+        if mode != .full { return inboxKey(e) }
         let chars = e.charactersIgnoringModifiers ?? ""
         let ctrlB = e.modifierFlags.contains(.control) && chars.lowercased() == "b"
+        if e.modifierFlags.contains(.command) && chars == "i" {
+            mode = .inbox
+            return true
+        }
         if help {
             help = false
             return true
@@ -956,6 +991,8 @@ struct HerdPane: View {
                 message("hc not on PATH · install herdr-core:\ncurl -fsSL https://releases.herdr.dev/core/install.sh | sh")
             } else if host.spaces.isEmpty {
                 message(host.online ? "no herdr spaces in herdr-core" : "connecting to herdr-core…")
+            } else if host.mode != .full {
+                HerdInbox(store: store, host: host, cell: cell)
             } else {
                 HStack(spacing: 0) {
                     if host.sidebarCollapsed {
@@ -1323,6 +1360,11 @@ struct HerdPane: View {
             }
             .buttonStyle(.plain)
             Spacer(minLength: 0)
+            Button { host.mode = .inbox } label: {
+                HerdLine(spans: [.init(text: "⌘I", fg: Mocha.accent, bold: true),
+                                 .init(text: " inbox ", fg: Mocha.overlay0)], cols: 9, cell: cell)
+            }
+            .buttonStyle(.plain)
         }
         .frame(height: cell.h)
         .background(Mocha.panelBG)
