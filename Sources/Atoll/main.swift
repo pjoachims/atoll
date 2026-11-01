@@ -1625,7 +1625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // the + card needs the full island; a window tab gets it back after
                 if self.store.expanded { self.setExpanded(true) }
                 guard adding else { return }
-                self.typedSinceExpand = true // pin open while the form is up
+                self.pinned = true // pin open while the form is up
                 self.panel.makeKey()
                 // steal the keyboard back from the pane so @FocusState can take it
                 self.panel.makeFirstResponder(self.panel.contentView)
@@ -1644,17 +1644,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &bag)
         setExpanded(false)
         panel.orderFrontRegardless()
-
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            self?.typedSinceExpand = true
-            return e
-        }
-        // a click into a window tab's app pins the island like typing does
-        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
-            if let f = WindowHost.shared.shown?.frame, f.contains(NSEvent.mouseLocation) {
-                self?.typedSinceExpand = true
-            }
-        }
 
         // collapse when keyboard focus leaves the embedded pane (click in another app)
         NotificationCenter.default.addObserver(
@@ -1734,7 +1723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     hit = t.name
                     store.selected = t.name
                     setExpanded(true)
-                    typedSinceExpand = true
+                    pinned = true
                 }
             }
             return hit != nil ? "ok\n" : "err: no tab named \(arg)\n"
@@ -1759,7 +1748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     var collapseTimer: Timer?
-    var typedSinceExpand = false
+    var pinned = false
 
     func applicationWillTerminate(_ notification: Notification) {
         HerdHost.shared.setEnabled(false)
@@ -1769,17 +1758,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func hoverChanged(_ h: Bool) {
         hovering = h
-        if h {
-            collapseTimer?.invalidate()
-            collapseTimer = nil
-            setExpanded(true)
-        } else {
-            scheduleCollapse()
-        }
+        if h { setExpanded(true) }
     }
 
-    // SwiftUI hover events flap during the frame animation; trust the actual
-    // mouse position instead and only collapse once it has really left.
+    // SwiftUI hover events flap during the frame animation and the exit can be
+    // lost entirely, so poll the actual mouse position for as long as the
+    // island is open and collapse once it has really left.
     func scheduleCollapse() {
         guard collapseTimer == nil, store.expanded else { return }
         collapseTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
@@ -1791,10 +1775,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // parked in the notch is outside the frame but still "on" the island
             if self.notchRect.contains(m) { return }
             if let f = WindowHost.shared.shown?.frame, f.insetBy(dx: -8, dy: -8).contains(m) { return }
-            // pinned only when the user actually typed into the pane (or clicked
-            // into a window tab's app, which then stays frontmost)
+            // an explicit open (hotkey, atollctl, the + form) stays until focus leaves
             let windowActive = WindowHost.shared.shown?.app.isActive == true
-            if (self.panel.isKeyWindow || windowActive) && self.typedSinceExpand { return }
+            if (self.panel.isKeyWindow || windowActive) && self.pinned { return }
             self.collapseTimer?.invalidate()
             self.collapseTimer = nil
             self.setExpanded(false)
@@ -1885,6 +1868,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = e && !store.overMenuBar ? NSWindow.Level(rawValue: NSWindow.Level.modalPanel.rawValue - 1) : .statusBar
         // hand the keyboard back to whatever app had it before auto-focus
         if !e, panel.isKeyWindow { panel.orderOut(nil) }
+        if !e {
+            collapseTimer?.invalidate()
+            collapseTimer = nil
+        }
         let sc = screen
         let w: CGFloat
         let h: CGFloat
@@ -1918,9 +1905,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             WindowHost.shared.hide()
         }
         if e && !wasExpanded {
-            typedSinceExpand = false
+            pinned = false
             if store.autoFocus { focusPrompt() }
         }
+        if e { scheduleCollapse() }
     }
 
     // cursor straight into the selected pane — type immediately
@@ -1946,7 +1934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setExpanded(false)
         } else {
             setExpanded(true)
-            typedSinceExpand = true // pin until the user clicks elsewhere or toggles
+            pinned = true // the mouse may be anywhere: stay until focus leaves or toggle
             focusPrompt() // explicit invocation always focuses, ignores autoFocus
         }
     }
