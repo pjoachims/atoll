@@ -1523,6 +1523,7 @@ struct HerdPaneView: View {
 
 extension Notification.Name {
     static let atollPaneScrolled = Notification.Name("atollPaneScrolled")
+    static let atollFontChanged = Notification.Name("atollFontChanged")
 }
 
 // `hc attach` in a regular pane, keyed "herd:<address>" so it never collides

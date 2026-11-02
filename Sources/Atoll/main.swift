@@ -454,6 +454,7 @@ final class PaneHost: NSObject, LocalProcessTerminalViewDelegate {
         for t in terms.values {
             t.font = paneFont(fontSize)
         }
+        NotificationCenter.default.post(name: .atollFontChanged, object: nil)
     }
 
     // theme change: recolor live panes in place
