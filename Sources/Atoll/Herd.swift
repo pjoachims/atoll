@@ -260,6 +260,10 @@ final class HerdHost: ObservableObject {
             guard let self else { return e }
             return self.handleKey(e) ? nil : e
         }
+        // the sidebar, tab bar and inbox are laid out in the panes' cells
+        NotificationCenter.default.addObserver(forName: .atollFontChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.objectWillChange.send()
+        }
     }
 
     func state(_ address: String) -> HerdState {
@@ -808,6 +812,15 @@ final class HerdHost: ObservableObject {
 
     private func handleKey(_ e: NSEvent) -> Bool {
         guard keysActive, e.window is IslandPanel else { return false }
+        // ⌘+/⌘-/⌘0 otherwise only work while a terminal is on screen, not on the inbox
+        if e.modifierFlags.contains(.command) {
+            switch e.charactersIgnoringModifiers {
+            case "+", "=": PaneHost.shared.bumpFont(+1); return true
+            case "-": PaneHost.shared.bumpFont(-1); return true
+            case "0": PaneHost.shared.bumpFont(0); return true
+            default: break
+            }
+        }
         // text fields (renames, the + card) keep their keys
         if e.window?.firstResponder is NSTextView { return mode == .compose && composeKey(e) }
         if mode != .full { return inboxKey(e) }
@@ -904,11 +917,17 @@ final class HerdHost: ObservableObject {
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
-        p.waitUntilExit()
-        let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return s.hasPrefix("/") ? s : nil
+        if (try? p.run()) != nil {
+            p.waitUntilExit()
+            let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if s.hasPrefix("/") { return s }
+        }
+        // a login shell skips .zshrc, where ~/.local/bin usually joins PATH
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return ["\(home)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+            .map { "\($0)/\(tool)" }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     static func quote(_ s: String) -> String {
