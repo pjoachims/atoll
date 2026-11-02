@@ -60,7 +60,17 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-codesign -s - --force "$APP" 2>/dev/null || true
+# TCC grants (Accessibility for window tabs) follow the signing identity; an
+# ad-hoc signature changes every build and silently voids them. Reuse the local
+# self-signed identity when this Mac has one (agent-eyes/scripts/setup-signing.sh).
+KEYCHAIN="$HOME/Library/Keychains/agent-eyes-signing.keychain-db"
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "Agent Eyes Local Signing"; then
+  security unlock-keychain -p "$(cat "$HOME/.config/agent-eyes/keychain-password")" "$KEYCHAIN"
+  codesign --force --sign "Agent Eyes Local Signing" --keychain "$KEYCHAIN" --identifier dev.pj.atoll "$APP"
+else
+  echo "no local signing identity; signing ad hoc, so rebuilds lose Accessibility"
+  codesign -s - --force "$APP" 2>/dev/null || true
+fi
 echo "built: $PWD/$APP (v$VERSION)"
 
 # keep the installed copy in sync

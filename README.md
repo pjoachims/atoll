@@ -65,6 +65,19 @@ Beyond terminals, a tab can be:
   { "name": "Browser", "type": "browser" }
   ```
 
+- **Herd** — herdr's own screen, drawn natively from
+  [herdr-core](https://github.com/herdrdev/herdr-core) (`hc` on PATH). "+" →
+  Herd, or:
+  ```json
+  { "name": "Herd", "type": "herd" }
+  ```
+  Spaces, tabs and splits come from the `herdr-app` document in core, status
+  from `hc events`, and every pane is a live `hc attach`. It looks like
+  herdr's defaults: the spaces/agents sidebar (`«` collapses it), numbered
+  tabs, and boxed splits. ctrl+\ detaches a pane. While collapsed, the pill
+  shows herdr's status dot per agent and flashes when one gets blocked or
+  finishes.
+
 ### atollctl — script the island
 
 The app listens on a local socket (`~/.config/atoll/atoll.sock`) so anything
